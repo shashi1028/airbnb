@@ -1,0 +1,692 @@
+<?php
+
+/**
+ * @file
+ * Adds support for sending SMS messages using the RouteSMS gateway.
+ */
+
+/**
+ * Implements hook_gateway_info().
+ */
+function sms_routesms_gateway_info() {
+  return array(
+    'routesms' => array(
+      'name' => t('RouteSMS'),
+      'configure form' => 'sms_routesms_admin_form',
+      'send' => 'sms_routesms_send',
+      'delivery process' => 'sms_routesms_delivery_process',
+    ),
+  );
+}
+
+/**
+ * Generates the administrative configuration form.
+ *
+ * @param array $configuration
+ *   The stored gateway configuration.
+ *
+ * @return array
+ *   The form array.
+ */
+function sms_routesms_admin_form(array $configuration) {
+  $form['sms_routesms_balance'] = array(
+    '#type' => 'item',
+    '#title' => t('Current balance'),
+    '#value' => sms_routesms_balance(),
+  );
+
+  $configuration += array(
+    'sms_routesms_ssl' => FALSE,
+    'sms_routesms_user' => '',
+    'sms_routesms_password' => '',
+    'sms_routesms_server' => '',
+    'sms_routesms_port' => '',
+    'sms_routesms_test_number' => '',
+    'sms_routesms_dlr_url' => '',
+  );
+
+  $form['sms_routesms_ssl'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use SSL Encyption'),
+    '#description' => t("Ensure you have SSL properly configured on your server."),
+    '#default_value' => $configuration['sms_routesms_ssl'],
+  );
+  $form['sms_routesms_user'] = array(
+    '#type' => 'textfield',
+    '#title' => t('User'),
+    '#description' => t('The username of your RouteSMS account.'),
+    '#size' => 40,
+    '#maxlength' => 255,
+    '#default_value' => $configuration['sms_routesms_user'],
+  );
+  $form['sms_routesms_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Password'),
+    '#description' => t('The current password on your RouteSMS account.'),
+    '#size' => 30,
+    '#maxlength' => 64,
+    '#default_value' => $configuration['sms_routesms_password'],
+  );
+  $form['sms_routesms_server'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Server'),
+    '#description' => t('The server handling your RouteSMS requests.'),
+    '#size' => 30,
+    '#maxlength' => 64,
+    '#default_value' => $configuration['sms_routesms_server'],
+  );
+  $form['sms_routesms_port'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Port'),
+    '#description' => t('The port on the RouteSMS server handling your requests.'),
+    '#size' => 30,
+    '#maxlength' => 64,
+    '#default_value' => $configuration['sms_routesms_port'],
+    '#element_validate' => ['element_validate_integer_positive'],
+  );
+  $form['sms_routesms_test_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Number'),
+    '#description' => t('A number to confirm configuration settings. You will receive an sms if the settings are ok.'),
+    '#size' => 30,
+    '#maxlength' => 64,
+    '#default_value' => $configuration['sms_routesms_test_number'],
+    '#element_validate' => ['element_validate_integer_positive'],
+  );
+  $form['sms_routesms_dlr_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Delivery report url'),
+    '#description' => t('Url on this server for delivery reports. Leave blank to disable.'),
+    '#size' => 30,
+    '#maxlength' => 64,
+    '#default_value' => $configuration['sms_routesms_dlr_url'],
+  );
+
+  return $form;
+}
+
+/**
+ * Validates the submission of the configuration form.
+ */
+function sms_routesms_admin_form_validate(array $form, array &$form_state) {
+  $result = sms_routesms_command('test', array(), $form_state['values']);
+  if (!$result['status']) {
+    form_set_error('', t('A RouteSMS gateway error occurred: @error.', array('@error' => $result['message'])));
+  }
+}
+
+/**
+ * Returns custom additions to be added to the send forms.
+ */
+function sms_routesms_send_form() {
+  $form['country'] = array(
+    '#type' => 'select',
+    '#title' => t('Country'),
+    '#multiple' => FALSE,
+    '#options' => sms_routesms_country_codes(),
+    '#default_value' => 234,
+  );
+
+  return $form;
+}
+
+/**
+ * Processes RouteSMS delivery reports.
+ *
+ * @return array
+ *   Information about the delivery report. This is an array of arrays with each
+ *   sub-array containing information about the message delivery as follows:
+ *   - messageid: The message id of original message.
+ *   - sendtime: The UNIX timestamp when the message was submitted in UTC zone.
+ *   - donetime: The UNIX timestamp when delivery report was generated.
+ *   - status: The delivery report status.
+ *
+ *   The delivery report status is one of the following keywords: 'UNKNOWN',
+ *   'ACKED', 'ENROUTE', 'DELIVRD', 'EXPIRED', 'DELETED', 'UNDELIV', 'ACCEPTED',
+ *   'REJECTD'.
+ */
+function sms_routesms_delivery_process() {
+  // Statically stored status map. Look for a better way for this.
+  static $status;
+  if (!isset($status)) {
+    // 'UNKNOWN', 'ACKED', 'ENROUTE', 'DELIVRD', 'EXPIRED', 'DELETED',
+    // 'UNDELIV', 'ACCEPTED', 'REJECTD'.
+    $status = array(
+      'DELIVRD' => -1,
+      'UNDELIV' => -2,
+      'REJECTD' => -5,
+      'EXPIRED' => -6,
+      'UNKNOWN' => -7,
+      'ACKED' => -3,
+      'ENROUTE' => -3,
+      'DELETED' => -5,
+      'ACCEPTED' => -3,
+    );
+  }
+  $rep = array();
+  $rep[] = array(
+    'messageid' => trim($_POST['sMessageId']),
+    'sendtime' => date_create_from_format("Y-m-d H:i:s", $_POST['dtSubmit'], timezone_open('UTC'))->getTimestamp(),
+    'donetime' => date_create_from_format("Y-m-d H:i:s", $_POST['dtDone'], timezone_open('UTC'))->getTimestamp(),
+    'gateway status' => $_POST['sStatus'],
+    'status' => $status[$_POST['sStatus']],
+    'recipient' => $_POST['sMobileNo'],
+  );
+  return $rep;
+}
+
+/**
+ * Callback for sending SMS messages.
+ */
+function sms_routesms_send($number, $message, $options) {
+  $options = (array) $options;
+  if (isset($options['numbers'])) {
+    $number = $number . ',' . $options['numbers'];
+    unset($options['numbers']);
+  }
+  $number = str_replace(' ', '', $number);
+
+  // Implement split_sending for recipients more than 500 (default).
+  return sms_routesms_split_send(array(
+    'numbers' => explode(',', $number),
+    'message' => $message,
+  ) + $options);
+}
+
+/**
+ * Sends messages in smaller batches to recipients more than specified number.
+ *
+ * @param array $data
+ *   Array containing information on the message to be sent.
+ * @param int $maxsize
+ *   The maximum number of recipients per batch.
+ *
+ * @return array
+ *   The result of the message sending operation.
+ */
+function sms_routesms_split_send(array $data, $maxsize = 100) {
+  // Split the recipients into smaller batches.
+  $all_res = array(
+    'status' => FALSE,
+    'message' => '',
+    'report' => array(),
+  );
+  while (count($data['numbers']) > 0) {
+    $number = implode(',', array_slice($data['numbers'], 0, $maxsize));
+    $data['numbers'] = array_slice($data['numbers'], $maxsize);
+    if (trim($number)) {
+      $res = sms_routesms_command('send', $data + array('number' => $number));
+
+      // Merge $res into existing $all_res.
+      $all_res['status'] |= $res['status'];
+      $all_res['message'] .= "\n" . $res['message'];
+      $all_res['report'] += (array) $res['report'];
+    }
+  }
+  return $all_res;
+}
+
+/**
+ * Returns the credit balance from the RouteSMS gateway.
+ *
+ * @return string
+ *   The value of the credit balance.
+ */
+function sms_routesms_balance() {
+  return t('Not available.');
+}
+
+/**
+ * Executes a command using the RouteSMS API.
+ *
+ * @param string $command
+ *   The command to be executed.
+ * @param array $data
+ *   The data needed to execute the command.
+ * @param array $config
+ *   The gateway configuration to be used.
+ *
+ * @return array
+ *   The result of the message sending operation.
+ */
+function sms_routesms_command($command = 'test', array $data = array(), array $config = NULL) {
+  $gateway = sms_gateways('gateway', 'routesms');
+
+  if ($config == NULL) {
+    $config = $gateway['configuration'];
+  }
+
+  $config += array(
+    'sms_routesms_ssl' => TRUE,
+    'sms_routesms_user' => '',
+    'sms_routesms_password' => '',
+    'sms_routesms_server' => '',
+    'sms_routesms_port' => '',
+    'sms_routesms_test_number' => '',
+    'sms_routesms_dlr_url' => '',
+  );
+
+  if (!empty($config['sms_routesms_ssl'])) {
+    $scheme = 'https';
+  }
+  else {
+    $scheme = 'http';
+  }
+
+  // @TODO better handling of the type is needed (for now flash and plain text
+  // GSM 3.38 Character encoding implemented).
+  $query['username'] = $config['sms_routesms_user'];
+  $query['password'] = $config['sms_routesms_password'];
+  $query['type'] = empty($data['isflash']) ? 0 : 1;
+
+  // The standard format of the API is as below.
+  // http://ip/app/status?unique_id=%7&reason=%2&to=%p&from=%P&time=%t&status=%d
+  // http://<hostname>:Port/example.php?sender=%P&mobile=%p&dtSent=%t&msgid=%I&status=%d
+  if ($config['sms_routesms_dlr_url']) {
+    $query['dlr-url'] = urlencode($config['sms_routesms_dlr_url'] . '?sender=%P&number=%p&donetime%t&msgid=%I&status=%d&uuid=%7&reason=%2');
+  }
+  switch ($command) {
+    case 'send':
+      // Clean up strange characters from message.
+      $search = str_split('��`��');
+      $replace = str_split('\'\'\'""');
+      $message = urlencode(str_replace($search, $replace, $data['message']));
+
+      $sender = isset($data['sender']) ? $data['sender'] : variable_get('site_name', t('Websms'));
+      // Some basic cleanup of $sender.
+      $sender = str_replace(' ', '', urlencode($sender));
+      $query['destination'] = $data['number'];
+      $query['source'] = $sender;
+      $query['message'] = $message;
+      break;
+
+    case 'test':
+      $query['dlr'] = 0;
+      $query['destination'] = $config['sms_routesms_test_number'];
+      $query['source'] = substr(variable_get('site_name', t('Websms')), 0, 11);
+      $query['message'] = 'Configuration+Successful';
+      break;
+
+    default:
+      return array(
+        'status' => FALSE,
+        'message' => t('An error has occurred: Invalid command for gateway'),
+      );
+  }
+  $address = $scheme . '://' . $config['sms_routesms_server'] . ':' . $config['sms_routesms_port'] . '/bulksms/bulksms';
+  $http_result = drupal_http_request($address . '?' . drupal_http_build_query($query));
+
+  // Check for HTTP errors.
+  if (!empty($http_result->error)) {
+    watchdog('sms_routesms', 'An error occurred during the HTTP request: @error<br/>Query: @query', array(
+      '@error' => $http_result->error,
+      '@query' => $query,
+    ));
+    return array(
+      'status' => FALSE,
+      'message' => t('An error occurred during the HTTP request: @error', array('@error' => $http_result->error)),
+    );
+  }
+
+  $result = array(
+    'status' => FALSE,
+    'message' => t('Message sending failed. Unknown error.'),
+  );
+  if ($http_result->data) {
+    // Sample response formats.
+    // 1701|2348055494143|bc5f7425-c98c-445b-a1f7-4fc5e2acef7e,
+    // 1701|2348134496448|5122f879-2ba7-4469-8ae2-4091267ef389,
+    // 1701|2349876543|20cef313-1660-4b92-baa5-1b7ba45256a5
+    // 1701|2348055494143|3023779f-1722-4b7b-a3c8-d81f9e4bfc32,1706|23405
+    // 1704|2348055494143,1704|23405,1704|234509
+    // 1707|2348055494143,1706|23405,1707|234509
+    // Check for RouteSMS errors.
+    $mdata = explode(',', $http_result->data);
+    // Assume 4-digit codes.
+    $code_1 = substr($mdata[0], 0, 4);
+    if (count($mdata) < 2 && ($err = sms_routesms_checkerror($code_1)) !== FALSE) {
+      $result['status'] = FALSE;
+      $result['message'] = $err['description'];
+    }
+    else {
+      // Message Submitted Successfully, in this case response format is:
+      // 1701|<CELL_NO>|{<MESSAGE ID>},<ERROR CODE>|<CELL_NO>|{<MESSAGE ID>},...
+      $result['status'] = TRUE;
+      $result['message'] = t('Message submitted successfully');
+      $result['report'] = array();
+      foreach ($mdata as $data) {
+        list($error, $number, $msgid) = explode('|', $data);
+        $err = sms_routesms_checkerror($error);
+        $result['report'][$number] = array(
+          'status' => ($err === FALSE) ? TRUE : FALSE,
+          'error code' => ($err === FALSE) ? 0 : $err['code'],
+          'error' => ($err === FALSE) ? '' : $err['description'],
+          'message id' => $msgid,
+          'gateway' => 'routesms',
+        );
+      }
+    }
+  }
+  return $result;
+}
+
+
+/**
+ * Checks if there is an error based on the response code supplied.
+ *
+ * @param string $code
+ *   The response code.
+ *
+ * @return array|bool
+ *   Returns FALSE if there is no error, otherwise it returns an array with the
+ *   error code (number or text) and description if there is an error.
+ */
+function sms_routesms_checkerror($code) {
+  $desc = sms_routesms_send_error_codes();
+  if (array_key_exists($code, $desc)) {
+    return array('code' => $code, 'description' => $desc[$code]);
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Returns the possible error codes and messages from the gateway.
+ *
+ * @return array
+ *   An array of the possible error codes and corresponding messages.
+ */
+function sms_routesms_send_error_codes() {
+  return array(
+    '1702' => t('Invalid URL Error, This means that one of the parameters was not provided or left blank'),
+    '1703' => t('Invalid value in username or password field'),
+    '1704' => t('Invalid value in "type" field'),
+    '1705' => t('Invalid Message'),
+    '1706' => t('Invalid Destination'),
+    '1707' => t('Invalid Source (Sender)'),
+    '1708' => t('Invalid value for "dlr" field'),
+    '1709' => t('User validation failed'),
+    '1710' => t('Internal Error'),
+    '1025' => t('Insufficient Credit'),
+  );
+}
+
+/**
+ * Provides country codes and matching countries.
+ *
+ * @return array
+ *   Array of countries keyed by the country codes.
+ */
+function sms_routesms_country_codes() {
+  return array(
+    93 => t('Afghanistan'),
+    355 => t('Albania'),
+    213 => t('Algeria'),
+    376 => t('Andorra'),
+    244 => t('Angola'),
+    1264 => t('Anguilla'),
+    1268 => t('Antigua & Barbuda'),
+    54 => t('Argentina'),
+    374 => t('Armenia'),
+    297 => t('Aruba'),
+    61 => t('Australia'),
+    43 => t('Austria'),
+    994 => t('Azerbaijan'),
+    1242 => t('Bahamas'),
+    973 => t('Bahrain'),
+    880 => t('Bangladesh'),
+    1246 => t('Barbados'),
+    375 => t('Belarus'),
+    32 => t('Belgium'),
+    501 => t('Belize'),
+    229 => t('Benin'),
+    1441 => t('Bermuda'),
+    975 => t('Bhutan'),
+    591 => t('Bolivia'),
+    387 => t('Bosnia-Herzegovina'),
+    267 => t('Botswana'),
+    55 => t('Brazil'),
+    1284 => t('British Virgin Islands'),
+    673 => t('Brunei'),
+    359 => t('Bulgaria'),
+    226 => t('Burkina Faso'),
+    257 => t('Burundi'),
+    855 => t('Cambodia'),
+    237 => t('Cameroon'),
+    238 => t('Cape Verde'),
+    1345 => t('Cayman Islands'),
+    236 => t('Central African Republic'),
+    235 => t('Chad'),
+    56 => t('Chile'),
+    86 => t('China'),
+    57 => t('Colombia'),
+    269 => t('Comoros / Mayotte Island'),
+    242 => t('Congo'),
+    243 => t('Democratic Republic Congo'),
+    682 => t('Cook Islands'),
+    385 => t('Croatia'),
+    53 => t('Cuba'),
+    357 => t('Cyprus'),
+    420 => t('Czech Republic'),
+    45 => t('Denmark'),
+    253 => t('Djibouti'),
+    1767 => t('Dominica'),
+    670 => t('East Timor'),
+    593 => t('Ecuador'),
+    20 => t('Egypt'),
+    503 => t('El Salvador'),
+    240 => t('Equatorial Guinea'),
+    372 => t('Estonia'),
+    251 => t('Ethiopia'),
+    500 => t('Falkland Islands'),
+    298 => t('Faroe Islands'),
+    679 => t('Fiji'),
+    358 => t('Finland'),
+    33 => t('France'),
+    594 => t('French Guiana'),
+    689 => t('French Polynesia'),
+    241 => t('Gabon'),
+    220 => t('Gambia'),
+    995 => t('Georgia'),
+    49 => t('Germany'),
+    233 => t('Ghana'),
+    350 => t('Gibraltar'),
+    881 => t('Global Mobile Satellite'),
+    30 => t('Greece'),
+    299 => t('Greenland'),
+    1473 => t('Grenada'),
+    590 => t('Guadeloupe'),
+    1671 => t('Guam'),
+    502 => t('Guatemala'),
+    224 => t('Guinea'),
+    592 => t('Guyana'),
+    509 => t('Haiti'),
+    504 => t('Honduras'),
+    852 => t('HongKong'),
+    36 => t('Hungary'),
+    354 => t('Iceland'),
+    91 => t('India'),
+    62 => t('Indonesia'),
+    98 => t('Iran'),
+    964 => t('Iraq'),
+    353 => t('Ireland'),
+    972 => t('Israel'),
+    39 => t('Italy / Vatican City State'),
+    225 => t('Ivory Coast'),
+    1876 => t('Jamaica'),
+    81 => t('Japan'),
+    962 => t('Jordan'),
+    254 => t('Kenya'),
+    82 => t('Korea (South)'),
+    965 => t('Kuwait'),
+    996 => t('Kyrgyzstan'),
+    856 => t('Lao'),
+    371 => t('Latvia'),
+    961 => t('Lebanon'),
+    266 => t('Lesotho'),
+    231 => t('Liberia'),
+    218 => t('Libya'),
+    423 => t('Liechtenstein'),
+    370 => t('Lithuania'),
+    352 => t('Luxembourg'),
+    853 => t('Macau'),
+    389 => t('Macedonia'),
+    261 => t('Madagascar'),
+    265 => t('Malawi'),
+    60 => t('Malaysia'),
+    960 => t('Maldives'),
+    223 => t('Mali'),
+    356 => t('Malta'),
+    596 => t('Martinique'),
+    222 => t('Mauritania'),
+    230 => t('Mauritius'),
+    52 => t('Mexico'),
+    373 => t('Moldova'),
+    377 => t('Monaco (Kosovo)'),
+    976 => t('Mongolia'),
+    382 => t('Montenegro'),
+    1664 => t('Montserrat'),
+    212 => t('Morocco'),
+    258 => t('Mozambique'),
+    95 => t('Myanmar'),
+    264 => t('Namibia'),
+    977 => t('Nepal'),
+    31 => t('Netherlands'),
+    599 => t('Netherlands Antilles'),
+    687 => t('New Caledonia'),
+    64 => t('New Zealand'),
+    505 => t('Nicaragua'),
+    227 => t('Niger'),
+    234 => t('Nigeria'),
+    47 => t('Norway'),
+    968 => t('Oman'),
+    92 => t('Pakistan'),
+    970 => t('Palestine (+970)'),
+    9725 => t('Palestine (+9725)'),
+    507 => t('Panama'),
+    675 => t('Papua New Guinea'),
+    595 => t('Paraguay'),
+    51 => t('Peru'),
+    63 => t('Philippines'),
+    48 => t('Poland'),
+    351 => t('Portugal'),
+    974 => t('Qatar'),
+    262 => t('Reunion'),
+    40 => t('Romania'),
+    7 => t('Russia / Kazakhstan'),
+    250 => t('Rwanda'),
+    1670 => t('Saipan'),
+    1684 => t('Samoa (American)'),
+    685 => t('Samoa (Western)'),
+    378 => t('San Marino'),
+    882 => t('Satellite-Thuraya'),
+    966 => t('Saudi Arabia'),
+    221 => t('Senegal'),
+    381 => t('Serbia'),
+    248 => t('Seychelles'),
+    232 => t('Sierra Leone'),
+    65 => t('Singapore'),
+    421 => t('Slovakia'),
+    386 => t('Slovenia'),
+    252 => t('Somalia'),
+    27 => t('South Africa'),
+    34 => t('Spain / Canary Islands'),
+    94 => t('Sri Lanka'),
+    1869 => t('St. Kitts And Nevis'),
+    1758 => t('St. Lucia'),
+    1784 => t('St. Vincent'),
+    249 => t('Sudan'),
+    597 => t('Suriname'),
+    268 => t('Swaziland'),
+    46 => t('Sweden'),
+    41 => t('Switzerland'),
+    963 => t('Syria'),
+    886 => t('Taiwan'),
+    992 => t('Tajikistan'),
+    255 => t('Tanzania / Zanzibar'),
+    66 => t('Thailand'),
+    228 => t('Togo'),
+    676 => t('Tonga Islands'),
+    1868 => t('Trinidad and Tobago'),
+    216 => t('Tunisia'),
+    90 => t('Turkey'),
+    993 => t('Turkmenistan'),
+    1649 => t('Turks and Caicos Islands'),
+    256 => t('Uganda'),
+    44 => t('UK / Isle of Man / Jersey / Guernsey'),
+    380 => t('Ukraine'),
+    971 => t('United Arab Emirates'),
+    598 => t('Uruguay'),
+    1 => t('USA / Canada / Dominican Rep. / Puerto Rico'),
+    998 => t('Uzbekistan'),
+    678 => t('Vanuatu'),
+    58 => t('Venezuela'),
+    84 => t('Vietnam'),
+    967 => t('Yemen'),
+    260 => t('Zambia'),
+    263 => t('Zimbabwe'),
+  );
+}
+
+/**
+ * Converts a string to USC-2 encoding if necessary.
+ *
+ * @param string $message
+ *   The message string to be converted.
+ *
+ * @return string|false
+ *   Returns the encoded string, or false if the convert function is not
+ *   available.
+ */
+function sms_routesms_unicode($message) {
+  if (function_exists('iconv')) {
+    $latin = @iconv('UTF-8', 'ISO-8859-1', $message);
+    if (strcmp($latin, $message)) {
+      $arr = unpack('H*hex', @iconv('UTF-8', 'UCS-2BE', $message));
+      return strtoupper($arr['hex']) . '&unicode=1';
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_help().
+ */
+/**
+ * Implements hook_help().
+ */
+function sms_routesms_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#sms_routesms':
+      $filepath = dirname(__FILE__) . '/README.md';
+      if (file_exists($filepath)) {
+        $readme = file_get_contents($filepath);
+      }
+      else {
+        $filepath = dirname(__FILE__) . '/README.txt';
+        if (file_exists($filepath)) {
+          $readme = file_get_contents($filepath);
+        }
+      }
+      if (!isset($readme)) {
+        return NULL;
+      }
+      if (module_exists('markdown')) {
+        $filters = module_invoke('markdown', 'filter_info');
+        $info = $filters['filter_markdown'];
+
+        if (function_exists($info['process callback'])) {
+          $output = $info['process callback']($readme, NULL);
+        }
+        else {
+          $output = '<pre>' . $readme . '</pre>';
+        }
+      }
+      else {
+        $output = '<pre>' . $readme . '</pre>';
+      }
+
+      return $output;
+  }
+}

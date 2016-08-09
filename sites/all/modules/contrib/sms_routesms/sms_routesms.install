@@ -1,0 +1,13 @@
+<?php
+
+/**
+ * @file
+ * Uninstallation hooks for RouteSMS module.
+ */
+
+/**
+ * Implements hook_uninstall().
+ */
+function sms_routesms_uninstall() {
+  variable_del('sms_routesms_settings');
+}
